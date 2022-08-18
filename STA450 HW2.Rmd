@@ -1,0 +1,176 @@
+---
+title: "STA450 HW2"
+output: pdf_document
+date: '2022-03-20'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library('knitr')
+
+knitr::knit_hooks$set(margins = Pmisc::hook_plot_margins)
+knitr::knit_hooks$set(plot=Pmisc::hook_plot_beamer) 
+
+knitr::opts_chunk$set(echo=FALSE, prompt=TRUE, comment=NA,
+		dev='png', margins=1, fig.cap=' ',
+  fig.path=file.path('figure','excessDeaths'),    
+		fig.width=4, fig.height=4, half=NULL,
+		tidy=TRUE,tidy.opts=list(indent=2, width.cutoff=52)
+)
+
+knitr::opts_hooks$set(half = function(options) {
+    options$tidy.opts = list(width.cutoff = 12)#list(options$tidy.opts$width.cutoff/2)
+    options
+  })
+
+options(width=80)
+
+library('INLA')
+if(!file.exists("qData.xlsx"))
+  download.file(paste0('https://statistique.quebec.ca/docs-ken/',
+    'multimedia/DecesSemaine_QC_GrAge.xlsx'), 'qData.xlsx')
+xWide = openxlsx::read.xlsx('qData.xlsx', startRow=6)[-1,]
+colnames(xWide) = c('year','junk','age',
+  paste0('w', seq(1, ncol(xWide)-3)))
+x = reshape2::melt(xWide, id.vars=c('year','age'),
+  measure.vars = grep("^w[[:digit:]]+$", colnames(xWide)))
+x$dead = as.numeric(gsub("[[:space:]]", "", x$value))
+x$week = as.numeric(gsub("w", "", x$variable))
+x$year = as.numeric(x$year)
+x = x[order(x$year, x$week, x$age),
+  setdiff(names(x), c('variable','value'))]
+
+plot(x$year + x$week/53, x$dead, data=x, main="Death Counts in Different Age Group", ylab="counts", xlab="year")
+```
+
+```{r}
+newYearsDay = as.Date(ISOdate(x$year, 1,1))
+x$time = newYearsDay + 7 * (x$week-1) 
+x= x[!is.na(x$dead),]
+x = x[x$week < 53,]
+
+plot(x[x$age == 'Total', c('time','dead')], 
+  type='o', log='y', main="Total Deaths Along with Year (a)", xlab="year", ylab="counts")
+
+xWide2 = reshape2::dcast(x, week + age ~ year, value.var='dead')
+Syear = grep("[[:digit:]]", colnames(xWide2), value=TRUE)
+Scol = rainbow(length(Syear))
+matplot(xWide2[xWide2$age == 'Total', Syear],
+  type='l', lty=1, col=Scol, main="Weekly Deaths (b)", xlab="week", ylab="counts")
+legend('topright', 
+  col=Scol, legend=Syear, 
+  bty='n', lty=1, lwd=3, cex=0.6)
+
+x$covidYear = pmax(x$year, 2019)
+xAgg = reshape2::dcast(
+  x,
+  covidYear + week ~ age,
+  value.var = 'dead',
+  fun.aggregate = mean
+  )
+```
+
+```{r}
+xBase = xAgg[xAgg$covidYear == 2019,]
+rownames(xBase) = xBase$week
+xDiff = xAgg[xAgg$covidYear != 2019,]
+
+ageCols = unique(x$age)
+xDiff[, ageCols] = xDiff[, ageCols] - 
+    xBase[as.character(xDiff$week), ageCols]
+```
+
+```{r}
+matplot(xDiff$covidYear + xDiff$week/53, xDiff[,ageCols], type='l', lty=1, main="Excessive Death", xlab="year", ylab="counts")
+legend('topright', lty=1, col=1:length(ageCols), ageCols, bty='n')
+
+dateCutoff = as.Date('2020/3/1')
+xPreCovid = x[x$time < dateCutoff, ]
+xPostCovid = x[x$time >= dateCutoff, ]
+toForecast = expand.grid(age = unique(x$age),
+  time = unique(xPostCovid$time), dead = NA)
+```
+
+```{r}
+xForInla = rbind(xPreCovid[,colnames(toForecast)], toForecast)
+xForInla= xForInla[order(xForInla$time, xForInla$age), ]
+xForInla$timeNumeric = as.numeric(xForInla$time)
+xForInla$timeForInla = (xForInla$timeNumeric - 
+  as.numeric(as.Date('2015/1/1')))/365.25
+xForInla$timeIid = xForInla$timeNumeric
+xForInla$sin12 = sin(2*pi*xForInla$timeNumeric/365.25)
+xForInla$sin6 = sin(2*pi*xForInla$timeNumeric*2/365.25)
+xForInla$cos12 = cos(2*pi*xForInla$timeNumeric/365.25)
+xForInla$cos6 = cos(2*pi*xForInla$timeNumeric*2/365.25)
+xForInlaTotal= xForInla[xForInla$age == 'Total', ]
+library(INLA, verbose=FALSE)
+res = inla(dead ~ sin12 + sin6 + cos12 + cos6 + 
+    f(timeIid, prior='pc.prec', param= c(log(1.2), 0.5)) + 
+    f(timeForInla, model = 'rw2', scale.model=FALSE,
+      prior='pc.prec', param= c(0.05, 0.55)), 
+  data=xForInlaTotal,
+  control.predictor = list(compute=TRUE, link=1),
+  control.compute = list(config=TRUE),
+#  control.inla = list(fast=FALSE, strategy='laplace'),
+  family='poisson')
+```
+
+```{r}
+qCols = paste0(c(0.5, 0.025, 0.975), 'quant')
+rbind(
+  res$summary.fixed[,qCols],
+  Pmisc::priorPostSd(res)$summary[,qCols])
+```
+
+```{r}
+matplot(
+  xForInlaTotal$time,
+  res$summary.fitted.values[,qCols],
+  type='l', ylim = c(1000, 1800), lty=c(1,2,2), col='black',
+  log='y', main="Predicted Death Counts", xlab="Year", ylab="Counts")
+points(x[x$age == 'Total', c('time','dead')], cex=0.4, col='red')
+```
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("Biobase")
+
+sampleList = INLA::inla.posterior.sample(30, res, 
+  selection = list(Predictor=0))
+sampleIntensity = exp(do.call(cbind, 
+  Biobase::subListExtract(sampleList, 'latent')))
+sampleDeaths = matrix(rpois(length(sampleIntensity), sampleIntensity),
+  nrow(sampleIntensity), ncol(sampleIntensity))
+```
+
+```{r}
+matplot(xForInlaTotal$time, sampleDeaths, col='#00000010', lwd=2,
+  lty=1,type='l', log='y', main="Posterior Samples", xlab="Year", ylab="Counts")
+points(x[x$age == 'Total', c('time','dead')], col='red', cex=0.5)
+
+
+matplot(xForInlaTotal$time, sampleDeaths, col='#00000010', lwd=2,
+  lty=1,type='l', log='y', xlim = as.Date(c('2019/6/1', '2020/11/1')),
+  ylim = c(1,2.3)*1000, main="Posterior Samples", xlab="Time", ylab="Counts")
+points(x[x$age == 'Total', c('time','dead')], col='red', cex=0.5)
+```
+
+```{r}
+xPostCovidTotal = xPostCovid[xPostCovid$age == 'Total', ]
+xPostCovidForecast = sampleDeaths[
+  match(xPostCovidTotal$time, xForInlaTotal$time), ]
+excessDeaths = xPostCovidTotal$dead - xPostCovidForecast
+```
+
+```{r}
+matplot(xPostCovidTotal$time, xPostCovidForecast, type='l', 
+  ylim = c(1000, 2200), col='black', main="Death Counts Post-COVID", xlab="Time", ylab="Counts")
+points(xPostCovidTotal[,c('time','dead')], col='red')
+matplot(xPostCovidTotal$time, excessDeaths, type='l', lty=1, col='#00000030', main="Prediction of Death Counts Post-COVID", xlab="Time", ylab="Counts")
+```
+
